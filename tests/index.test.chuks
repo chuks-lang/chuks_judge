@@ -1,0 +1,374 @@
+import { test } from "std/test"
+import { Channel } from "std/channel"
+import { EvalCase, EvalResult, DimScore, DimensionConfig, FewShotExample, PairwiseCase, PairwiseResult, ConversationTurn, ConversationCase, EvalBatch, EvalError } from "../src/types"
+import { EvalReport, RegressionReport, ComparisonReport } from "../src/report"
+import { judge } from "../src/index.chuks"
+
+// ─── Test harness ────────────────────────────────────────────────────────────
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+
+function pass(label: string): void {
+    passed = passed + 1
+    println("  PASS: " + label)
+}
+
+function fail(label: string, detail: string): void {
+    failed = failed + 1
+    failures.push("FAIL: " + label + " — " + detail)
+    println("  FAIL: " + label + " — " + detail)
+}
+
+function check(cond: bool, label: string, detail: string): void {
+    if (cond) { pass(label) } else { fail(label, detail) }
+}
+
+function approx(actual: float, expected: float, eps: float, label: string): void {
+    var diff: float = actual - expected
+    if (diff < 0.0) { diff = diff * -1.0 }
+    check(diff <= eps, label, "expected ~" + string(expected) + ", got " + string(actual))
+}
+
+// ─── Mock judge model (offline; no network) ───────────────────────────────────
+// Returns a deterministic structured response derived from the prompt so the
+// scoring / parallel / report machinery can be exercised without an LLM.
+// The "actual" text is embedded in the prompt; we score by a simple heuristic.
+
+class MockModel {
+    var _calls: int = 0
+
+    // structured mirrors the AI client's structured(prompt, schema) shape.
+    public async structured(prompt: string, schema: any): Task<any> {
+        this._calls = this._calls + 1
+
+        // Pairwise prompts ask for a winner.
+        if (prompt.contains("which is better")) {
+            return { "winner": "B", "scoreA": 0.6, "scoreB": 0.9, "reasoning": "B is more complete" }
+        }
+
+        // Score high when the case is marked [GOOD], low when marked [BAD].
+        // The marker lives in the case input, so it cannot collide with the
+        // rubric text (which itself contains words like "correct").
+        var score: float = 0.4
+        if (prompt.contains("[GOOD]")) { score = 0.9 }
+
+        return {
+            "score": score,
+            "passed": score >= 0.7,
+            "reasoning": "heuristic score " + string(score),
+            "issues": [],
+        }
+    }
+}
+
+// A model that always returns null, to exercise the retry / failure path.
+class NullModel {
+    public async structured(prompt: string, schema: any): Task<any> {
+        return null
+    }
+}
+
+// ─── Type construction tests ──────────────────────────────────────────────────
+
+function testTypes(): void {
+    var c1: EvalCase = new EvalCase({
+        id: "test-1", input: "What is 2+2?", expected: "4",
+        actual: "The answer is 4.", context: "math",
+        tags: ["math", "arithmetic"], category: "factual", weight: 1.5,
+    })
+    check(c1.id == "test-1", "EvalCase: id", c1.id)
+    check(c1.tags.length == 2, "EvalCase: tags length", string(c1.tags.length))
+    approx(c1.weight, 1.5, 0.001, "EvalCase: weight")
+
+    var c2: EvalCase = new EvalCase({})
+    check(c2.id == "", "EvalCase: empty id default", "'" + c2.id + "'")
+    approx(c2.weight, 1.0, 0.001, "EvalCase: weight default")
+    check(c2.tags.length == 0, "EvalCase: tags default empty", string(c2.tags.length))
+
+    var r1: EvalResult = new EvalResult({
+        id: "res-1", score: 0.85, passed: true, reasoning: "Good",
+        issues: ["minor"], tokens: 150, judgeModel: "openai:gpt-4o",
+    })
+    approx(r1.score, 0.85, 0.001, "EvalResult: score")
+    check(r1.passed, "EvalResult: passed", "expected true")
+    check(r1.issues.length == 1, "EvalResult: issues length", string(r1.issues.length))
+    check(r1.tokens == 150, "EvalResult: tokens", string(r1.tokens))
+
+    var ds: DimScore = new DimScore("accuracy", 0.9, 0.7, true, "accurate")
+    check(ds.name == "accuracy", "DimScore: name", ds.name)
+    check(ds.passed, "DimScore: passed", "expected true")
+
+    var dc: DimensionConfig = new DimensionConfig({ name: "clarity", weight: 1.5, threshold: 0.8, criteria: "clear" })
+    check(dc.name == "clarity", "DimensionConfig: name", dc.name)
+    approx(dc.weight, 1.5, 0.001, "DimensionConfig: weight")
+
+    var fs: FewShotExample = new FewShotExample({ input: "Q", expected: "A", actual: "A", score: 0.9, reasoning: "ok" })
+    approx(fs.score, 0.9, 0.001, "FewShotExample: score")
+
+    var pc: PairwiseCase = new PairwiseCase("Explain ML", "A text", "B text")
+    check(pc.input == "Explain ML", "PairwiseCase: input", pc.input)
+
+    var pr: PairwiseResult = new PairwiseResult({ input: "X", winner: "B", scoreA: 0.7, scoreB: 0.9, reasoning: "B" })
+    check(pr.winner == "B", "PairwiseResult: winner", pr.winner)
+
+    var turn1: ConversationTurn = new ConversationTurn("user", "Hello")
+    var cc: ConversationCase = new ConversationCase([turn1], "greeting")
+    check(cc.turns.length == 1, "ConversationCase: turns", string(cc.turns.length))
+
+    var batch: EvalBatch = new EvalBatch(10, 8, 2, 80.0)
+    check(batch.passed == 8, "EvalBatch: passed", string(batch.passed))
+
+    var err: EvalError = new EvalError(3, "timeout", { id: "case-3" })
+    check(err.caseIndex == 3, "EvalError: caseIndex", string(err.caseIndex))
+    check(err.message == "timeout", "EvalError: message", err.message)
+}
+
+// ─── Report tests ─────────────────────────────────────────────────────────────
+
+function buildSampleReport(): EvalReport {
+    var results: []any = []
+    results.push(new EvalResult({ id: "a", score: 0.9, passed: true, tokens: 100, cost: 0.001, tags: ["t1"], category: "cat-a" }))
+    results.push(new EvalResult({ id: "b", score: 0.8, passed: true, tokens: 120, cost: 0.002, tags: ["t1"], category: "cat-a" }))
+    results.push(new EvalResult({ id: "c", score: 0.5, passed: false, tokens: 80, cost: 0.001, tags: ["t2"], category: "cat-b" }))
+    results.push(new EvalResult({ id: "d", score: 0.3, passed: false, tokens: 90, cost: 0.001, tags: ["t2"], category: "cat-b" }))
+    var report: EvalReport = new EvalReport()
+    report.buildFromResults(results, 2000)
+    return report
+}
+
+function testReport(): void {
+    var report: EvalReport = buildSampleReport()
+    check(report.totalCases == 4, "report: totalCases", string(report.totalCases))
+    check(report.passed == 2, "report: passed", string(report.passed))
+    check(report.failed == 2, "report: failed", string(report.failed))
+    approx(report.passRate, 50.0, 0.001, "report: passRate")
+    approx(report.avgScore, 0.625, 0.001, "report: avgScore")
+    check(report.totalTokens == 390, "report: totalTokens", string(report.totalTokens))
+
+    var failedCases: []any = report.filter(function(r: any): bool { return !r.passed })
+    check(failedCases.length == 2, "report: filter failed", string(failedCases.length))
+
+    var topResults: []any = report.top(2)
+    approx(topResults[0].score, 0.9, 0.001, "report: top first score")
+
+    var bottomResults: []any = report.bottom(2)
+    approx(bottomResults[0].score, 0.3, 0.001, "report: bottom first score")
+
+    var groups: map[string]any = report.groupBy("category")
+    check(groups.has("cat-a"), "report: groupBy cat-a present", "missing")
+    check(groups.has("cat-b"), "report: groupBy cat-b present", "missing")
+    var ga: any = groups.get("cat-a")
+    check(ga.results.length == 2, "report: groupBy cat-a size", string(ga.results.length))
+
+    var t1Report: EvalReport = report.withTag("t1")
+    check(t1Report.totalCases == 2, "report: withTag t1", string(t1Report.totalCases))
+
+    var md: string = report.toMarkdown()
+    check(md.length > 0, "report: markdown non-empty", "empty")
+    check(md.includes("Evaluation Report"), "report: markdown header", "missing header")
+
+    var emptyReport: EvalReport = new EvalReport()
+    emptyReport.buildFromResults([], 0)
+    check(emptyReport.totalCases == 0, "report: empty totalCases", string(emptyReport.totalCases))
+    approx(emptyReport.passRate, 0.0, 0.001, "report: empty passRate")
+
+    var compReport: ComparisonReport = new ComparisonReport()
+    compReport.winner = "A"
+    check(compReport.winner == "A", "ComparisonReport: winner", compReport.winner)
+
+    var regReport: RegressionReport = new RegressionReport()
+    regReport.baselineName = "v1.0"
+    regReport.passRateDelta = -3.5
+    check(regReport.baselineName == "v1.0", "RegressionReport: baseline", regReport.baselineName)
+    check(!regReport.isRegression, "RegressionReport: not regression", "expected false")
+}
+
+// ─── Evaluator tests (offline, mock model) ────────────────────────────────────
+
+async function testEvaluateSingle(): Task<void> {
+    var ev = judge.create({ model: new MockModel(), criteria: "accuracy", threshold: 0.7 })
+
+    var good: EvalResult = await ev.evaluate(new EvalCase({ id: "g", input: "Is this [GOOD]?", actual: "yes", expected: "yes" }))
+    check(good.passed, "evaluate: correct case passes", "expected pass, score " + string(good.score))
+    approx(good.score, 0.9, 0.001, "evaluate: correct case score")
+    check(good.id == "g", "evaluate: id carried through", good.id)
+    check(good.judgeModel == "custom", "evaluate: judgeModel custom", good.judgeModel)
+
+    var bad: EvalResult = await ev.evaluate(new EvalCase({ id: "b", input: "this is [BAD]", actual: "no", expected: "yes" }))
+    check(!bad.passed, "evaluate: weak case fails", "expected fail, score " + string(bad.score))
+    return
+}
+
+async function testBinaryScoring(): Task<void> {
+    var ev = judge.create({ model: new MockModel(), criteria: "x", threshold: 0.7, scoreType: "binary" })
+    var r: EvalResult = await ev.evaluate(new EvalCase({ id: "bin", input: "[GOOD] one", actual: "a", expected: "a" }))
+    approx(r.score, 1.0, 0.001, "binary: high score becomes 1.0")
+    check(r.passed, "binary: passes", "expected pass")
+    return
+}
+
+async function testRunAllParallel(): Task<void> {
+    var ev = judge.create({ model: new MockModel(), criteria: "accuracy", threshold: 0.7, workers: 4, batchSize: 2 })
+    var cases: []any = []
+    cases.push(new EvalCase({ id: "1", input: "[GOOD] a", actual: "a", expected: "a" }))
+    cases.push(new EvalCase({ id: "2", input: "[GOOD] b", actual: "b", expected: "b" }))
+    cases.push(new EvalCase({ id: "3", input: "[BAD] c", actual: "c", expected: "x" }))
+    cases.push(new EvalCase({ id: "4", input: "[GOOD] d", actual: "d", expected: "d" }))
+    cases.push(new EvalCase({ id: "5", input: "[BAD] e", actual: "e", expected: "x" }))
+
+    var report: EvalReport = await ev.runAll(cases)
+    check(report.totalCases == 5, "runAll: totalCases", string(report.totalCases))
+    check(report.passed == 3, "runAll: passed count", string(report.passed))
+    check(report.failed == 2, "runAll: failed count", string(report.failed))
+    approx(report.passRate, 60.0, 0.001, "runAll: passRate")
+    return
+}
+
+async function testRunAllEmpty(): Task<void> {
+    var ev = judge.create({ model: new MockModel(), criteria: "x" })
+    var report: EvalReport = await ev.runAll([])
+    check(report.totalCases == 0, "runAll empty: totalCases", string(report.totalCases))
+    return
+}
+
+async function testCallbacks(): Task<void> {
+    var seen: []any = []
+    var ev = judge.create({
+        model: new MockModel(),
+        criteria: "x",
+        workers: 2,
+        callbacks: {
+            onResult: function(r: any): void { seen.push(r) },
+        },
+    })
+    var cases: []any = []
+    cases.push(new EvalCase({ id: "1", input: "[GOOD]", actual: "a", expected: "a" }))
+    cases.push(new EvalCase({ id: "2", input: "[GOOD]", actual: "b", expected: "b" }))
+    var report: EvalReport = await ev.runAll(cases)
+    check(seen.length == 2, "callbacks: onResult fired per case", string(seen.length))
+    return
+}
+
+async function testDimensions(): Task<void> {
+    var ev = judge.create({
+        model: new MockModel(),
+        criteria: "overall",
+        threshold: 0.7,
+        dimensions: [
+            new DimensionConfig({ name: "accuracy", weight: 2.0, threshold: 0.8, criteria: "correct facts" }),
+            new DimensionConfig({ name: "clarity", weight: 1.0, threshold: 0.6, criteria: "correct style" }),
+        ],
+    })
+    var r: EvalResult = await ev.evaluate(new EvalCase({ id: "d", input: "q", actual: "a", expected: "a" }))
+    check(r.dimensions.length == 2, "dimensions: per-dimension scores", string(r.dimensions.length))
+
+    var report: EvalReport = await ev.runAll([new EvalCase({ id: "d", input: "q", actual: "a", expected: "a" })])
+    check(report.dimensions.length == 2, "dimensions: aggregated report dims", string(report.dimensions.length))
+    return
+}
+
+async function testFewShot(): Task<void> {
+    var ev = judge.create({
+        model: new MockModel(),
+        criteria: "accuracy",
+        fewShot: [
+            new FewShotExample({ input: "2+2", expected: "4", actual: "4", score: 1.0, reasoning: "exact" }),
+        ],
+    })
+    var r: EvalResult = await ev.evaluate(new EvalCase({ id: "f", input: "[GOOD]", actual: "a", expected: "a" }))
+    check(r.score >= 0.0, "fewShot: evaluation completes", string(r.score))
+    return
+}
+
+async function testRetryFailure(): Task<void> {
+    var ev = judge.create({ model: new NullModel(), criteria: "x", maxRetries: 1 })
+    var r: EvalResult = await ev.evaluate(new EvalCase({ id: "fail", input: "q", actual: "a", expected: "a" }))
+    check(!r.passed, "retry: failed result not passed", "expected fail")
+    approx(r.score, 0.0, 0.001, "retry: failed score is 0")
+    check(r.issues.length == 1, "retry: judge_failure issue", string(r.issues.length))
+    return
+}
+
+async function testCompare(): Task<void> {
+    var ev = judge.create({ model: new MockModel(), criteria: "quality", workers: 2 })
+    var pairs: []any = []
+    pairs.push(new PairwiseCase("Q1", "A resp", "B resp"))
+    pairs.push(new PairwiseCase("Q2", "A resp", "B resp"))
+    var cmp: ComparisonReport = await ev.compare(pairs)
+    check(cmp.winner == "B", "compare: winner is B", cmp.winner)
+    approx(cmp.bWinRate, 100.0, 0.001, "compare: bWinRate")
+    check(cmp.improvement > 0.0, "compare: improvement positive", string(cmp.improvement))
+    return
+}
+
+async function testStreamAll(): Task<void> {
+    var ev = judge.create({ model: new MockModel(), criteria: "x", workers: 2, batchSize: 2 })
+    var cases: []any = []
+    cases.push(new EvalCase({ id: "1", input: "[GOOD]", actual: "a", expected: "a" }))
+    cases.push(new EvalCase({ id: "2", input: "[GOOD]", actual: "b", expected: "b" }))
+    cases.push(new EvalCase({ id: "3", input: "[GOOD]", actual: "c", expected: "c" }))
+
+    var outCh: Channel<EvalResult> = new Channel<EvalResult>(16)
+    var report: EvalReport = await ev.streamAll(cases, outCh)
+
+    var streamed: int = 0
+    while (true) {
+        var r: EvalResult? = outCh.receive()
+        if (r == null) { break }
+        streamed = streamed + 1
+    }
+    check(streamed == 3, "streamAll: streamed each result", string(streamed))
+    check(report.totalCases == 3, "streamAll: report totalCases", string(report.totalCases))
+    return
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function main(): Task<void> {
+    var start: int = test.now()
+    println("chuks_judge test suite")
+    println("══════════════════════════════════════════")
+
+    println("\n── Types ──")
+    testTypes()
+
+    println("\n── Report ──")
+    testReport()
+
+    println("\n── Evaluator: single ──")
+    await testEvaluateSingle()
+
+    println("\n── Evaluator: binary scoring ──")
+    await testBinaryScoring()
+
+    println("\n── Evaluator: runAll (parallel) ──")
+    await testRunAllParallel()
+
+    println("\n── Evaluator: runAll (empty) ──")
+    await testRunAllEmpty()
+
+    println("\n── Evaluator: callbacks ──")
+    await testCallbacks()
+
+    println("\n── Evaluator: dimensions ──")
+    await testDimensions()
+
+    println("\n── Evaluator: few-shot ──")
+    await testFewShot()
+
+    println("\n── Evaluator: retry/failure ──")
+    await testRetryFailure()
+
+    println("\n── Evaluator: A/B compare ──")
+    await testCompare()
+
+    println("\n── Evaluator: streamAll ──")
+    await testStreamAll()
+
+    println("══════════════════════════════════════════")
+    var elapsed: int = test.now() - start
+    test.report(passed, failed, failures, elapsed)
+    return
+}

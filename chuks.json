@@ -1,0 +1,13 @@
+{
+  "author": "Chuks Team",
+  "dependencies": {
+    "@chuks/ai": "^0.0.3"
+  },
+  "description": "LLM evaluation engine for Chuks — parallel judge-based scoring, regression testing, A/B comparison, and multi-dimensional evaluation at scale",
+  "entry": "src/index.chuks",
+  "keywords": ["llm", "evaluation", "judge", "testing", "ai", "benchmark", "scoring", "regression", "comparison"],
+  "license": "MIT",
+  "name": "@chuks/judge",
+  "repository": "https://github.com/chuks-lang/chuks_judge",
+  "version": "1.0.0"
+}

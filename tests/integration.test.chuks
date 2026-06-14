@@ -1,0 +1,135 @@
+// Live integration test for @chuks/judge against a local Ollama chat model,
+// driven through the real @chuks/ai client (installed via `chuks add @chuks/ai`).
+//
+// Exercises the REAL LLM-as-a-Judge path (evaluate / runAll / compare) end to
+// end with a real provider client. The offline suite uses a deterministic mock.
+//
+// Requires:
+//   ollama serve
+//   ollama pull llama3.1:8b
+//
+// If Ollama is not reachable the suite SKIPS (0 failures) so CI stays green.
+
+import { test } from "std/test"
+import { ai } from "pkg/@chuks/ai"
+import { judge, EvalCase, PairwiseCase, EvalResult, EvalReport, ComparisonReport } from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+
+const MODEL: string = "llama3.1:8b"
+
+function pass(label: string): void {
+    passed = passed + 1
+    println("  PASS: " + label)
+}
+
+function fail(label: string, detail: string): void {
+    failed = failed + 1
+    failures.push("FAIL: " + label + " — " + detail)
+    println("  FAIL: " + label + " — " + detail)
+}
+
+// ── Minimal Ollama judge model ──────────────────────────────────
+// Implements the structured(prompt, schema) contract: ask the model for a
+// Probe: is the model reachable and returning JSON?
+async function modelReady(model: any): Task<bool> {
+    try {
+        var resp: any = await model.structured("Reply with ok=true.", { "ok": "bool" })
+        return resp != null
+    } catch (e) {
+        return false
+    }
+}
+
+// A clearly-correct answer should not score below a clearly-wrong one.
+async function testEvaluateCorrectVsWrong(model: any): Task<void> {
+    var ev = judge.create({
+        model: model,
+        criteria: "Is the actual answer factually correct and consistent with the expected answer?",
+        threshold: 0.5,
+    })
+
+    var good: EvalResult = await ev.evaluate(new EvalCase({
+        id: "good", input: "What is the capital of France?",
+        expected: "Paris", actual: "The capital of France is Paris.",
+    }))
+    var bad: EvalResult = await ev.evaluate(new EvalCase({
+        id: "bad", input: "What is the capital of France?",
+        expected: "Paris", actual: "The capital of France is Berlin.",
+    }))
+
+    if (good.score >= 0.0 && good.score <= 1.0) { pass("evaluate: correct score in [0,1] (" + string(good.score) + ")") }
+    else { fail("evaluate: score range", "got " + string(good.score)) }
+
+    if (good.score >= bad.score) { pass("evaluate: correct (" + string(good.score) + ") >= wrong (" + string(bad.score) + ")") }
+    else { fail("evaluate: semantic ordering", "correct " + string(good.score) + " < wrong " + string(bad.score)) }
+
+    if (good.passed) { pass("evaluate: correct answer passes the threshold") }
+    else { fail("evaluate: correct passed", "factually-correct answer did not pass (score " + string(good.score) + ")") }
+    return
+}
+
+async function testRunAll(model: any): Task<void> {
+    var ev = judge.create({
+        model: model,
+        criteria: "Does the actual answer correctly answer the question?",
+        threshold: 0.5,
+        workers: 2,
+    })
+    var cases: []any = []
+    cases.push(new EvalCase({ id: "1", input: "2 + 2 = ?", expected: "4", actual: "4" }))
+    cases.push(new EvalCase({ id: "2", input: "Capital of Japan?", expected: "Tokyo", actual: "Tokyo" }))
+    cases.push(new EvalCase({ id: "3", input: "Capital of Japan?", expected: "Tokyo", actual: "Madrid" }))
+
+    var report: EvalReport = await ev.runAll(cases)
+    if (report.totalCases == 3) { pass("runAll: evaluated all 3 cases in parallel") }
+    else { fail("runAll: totalCases", "expected 3, got " + string(report.totalCases)) }
+    if (report.passRate >= 0.0 && report.passRate <= 100.0) { pass("runAll: passRate is a valid percentage (" + string(report.passRate) + ")") }
+    else { fail("runAll: passRate", "got " + string(report.passRate)) }
+    if (report.passed == 2 && report.failed == 1) { pass("runAll: 2 correct passed, 1 wrong failed") }
+    else { fail("runAll: pass/fail split", "expected 2 passed / 1 failed, got " + string(report.passed) + "/" + string(report.failed)) }
+    return
+}
+
+async function testCompare(model: any): Task<void> {
+    var ev = judge.create({
+        model: model,
+        criteria: "Which explanation is clearer and more helpful for a child?",
+        threshold: 0.5,
+    })
+    var cases: []any = []
+    cases.push(new PairwiseCase(
+        "Explain gravity to a 5-year-old",
+        "Gravity is the invisible pull that brings things down to the ground, like when you drop a ball and it falls.",
+        "g"
+    ))
+    var report: ComparisonReport = await ev.compare(cases)
+    if (report != null) { pass("compare: returned a comparison report") }
+    else { fail("compare", "returned null") }
+    return
+}
+
+async function main(): Task<void> {
+    var start: int = test.now()
+    println("@chuks/judge — live Ollama integration")
+    println("══════════════════════════════════════════")
+
+    var model: any = ai.ollama(MODEL, null)
+    var ready: bool = await modelReady(model)
+    if (!ready) {
+        println("\n  SKIP: Ollama not reachable with model '" + MODEL + "'.")
+        println("        Run `ollama serve` and `ollama pull " + MODEL + "` to enable this suite.")
+        println("══════════════════════════════════════════")
+        test.report(passed, failed, failures, test.now() - start)
+        return
+    }
+
+    println("\n── evaluate (correct vs wrong) ──"); await testEvaluateCorrectVsWrong(model)
+    println("\n── runAll (parallel batch) ──");      await testRunAll(model)
+    println("\n── compare (A/B) ──");                await testCompare(model)
+
+    println("══════════════════════════════════════════")
+    test.report(passed, failed, failures, test.now() - start)
+}

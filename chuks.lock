@@ -1,0 +1,33 @@
+{
+  "lockVersion": 1,
+  "packages": {
+    "@chuks/ai@0.0.3": {
+      "version": "0.0.3",
+      "commitSha": "3842e97e62f0d9d385ee56291008b37a61706086",
+      "contentHash": "d000a00c775e8c9d3ee97fdf0cf1be329d9ef89c898d980cf7a577912ca1dd3f",
+      "permissions": {
+        "chuksArrow": false,
+        "chuksToC": false,
+        "chuksToRust": false,
+        "crypto.hash": false,
+        "crypto.sign": false,
+        "db.access": false,
+        "env.read": true,
+        "env.write": false,
+        "fs.delete": false,
+        "fs.read": false,
+        "fs.write": false,
+        "install.scripts": false,
+        "net.bind": false,
+        "net.outbound": true,
+        "proc.exec": false,
+        "proc.exit": false,
+        "sys.info": false,
+        "sys.paths": false
+      },
+      "declaredDomains": [],
+      "acceptedAt": "2026-06-14T12:04:29Z"
+    }
+  },
+  "__signature": "hmac-sha256:JnQMDRywNLCSDS6nl633fV8zqhKn9bWsAEh1uqI5wSs="
+}

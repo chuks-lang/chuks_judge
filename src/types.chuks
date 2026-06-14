@@ -1,0 +1,262 @@
+// ─── chuks_judge/types ──────────────────────────────────────────────────────
+// Data types and classes for the LLM evaluation engine.
+//
+// Construction convention: classes that are built from a user-supplied map
+// literal take a `data: any` config and read each field with an explicit
+// `if (data.X != null)` null-check plus per-field coercion. The map literal is
+// genuinely dynamic user input (callers may omit any field), so reading it off
+// `any` is the correct, AOT-safe idiom — the previous `data.X || default` form
+// returns a bool under chuks 0.0.9 and must not be used.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Internal coercion helpers ───────────────────────────────────────────────
+
+// _toStrings coerces a dynamic array value into a typed []string.
+function _toStrings(src: any): []string {
+    var out: []string = []
+    if (src == null) { return out }
+    var i: int = 0
+    while (i < src.length) {
+        out.push(string(src[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// _toAnyList copies a dynamic array value into a typed []any.
+function _toAnyList(src: any): []any {
+    var out: []any = []
+    if (src == null) { return out }
+    var i: int = 0
+    while (i < src.length) {
+        out.push(src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Evaluation Case Types ──────────────────────────────────────────────────
+
+// EvalCase — a single test case for evaluation
+export class EvalCase {
+    var id: string = ""
+    var input: string = ""
+    var actual: string = ""
+    var expected: string = ""
+    var context: string = ""
+    var tags: []string = []
+    var category: string = ""
+    var weight: float = 1.0
+
+    constructor(data: any) {
+        if (data != null) {
+            if (data.id != null) { this.id = string(data.id) }
+            if (data.input != null) { this.input = string(data.input) }
+            if (data.actual != null) { this.actual = string(data.actual) }
+            if (data.expected != null) { this.expected = string(data.expected) }
+            if (data.context != null) { this.context = string(data.context) }
+            if (data.tags != null) { this.tags = _toStrings(data.tags) }
+            if (data.category != null) { this.category = string(data.category) }
+            if (data.weight != null) { this.weight = data.weight }
+        }
+    }
+}
+
+// ConversationTurn — a single turn in a multi-turn conversation
+export class ConversationTurn {
+    var role: string
+    var content: string
+
+    constructor(role: string, content: string) {
+        this.role = role
+        this.content = content
+    }
+}
+
+// ConversationCase — for multi-turn conversation evaluation
+export class ConversationCase {
+    var turns: []any
+    var finalExpected: string
+
+    constructor(turns: []any, finalExpected: string) {
+        this.turns = turns
+        this.finalExpected = finalExpected
+    }
+}
+
+// PairwiseCase — for A/B comparison evaluation
+export class PairwiseCase {
+    var input: string
+    var outputA: string
+    var outputB: string
+
+    constructor(input: string, outputA: string, outputB: string) {
+        this.input = input
+        this.outputA = outputA
+        this.outputB = outputB
+    }
+}
+
+// ─── Score Types ────────────────────────────────────────────────────────────
+
+// DimScore — per-dimension score in multi-dimensional evaluation
+export class DimScore {
+    var name: string
+    var score: float
+    var threshold: float
+    var passed: bool
+    var reasoning: string
+
+    constructor(name: string, score: float, threshold: float, passed: bool, reasoning: string) {
+        this.name = name
+        this.score = score
+        this.threshold = threshold
+        this.passed = passed
+        this.reasoning = reasoning
+    }
+}
+
+// ─── Evaluation Result Types ────────────────────────────────────────────────
+
+// EvalResult — the result of evaluating a single case
+export class EvalResult {
+    var id: string = ""
+    var input: string = ""
+    var expected: string = ""
+    var actual: string = ""
+    var tags: []string = []
+    var category: string = ""
+    var score: float = 0.0
+    var passed: bool = false
+    var dimensions: []any = []
+    var reasoning: string = ""
+    var issues: []string = []
+    var tokens: int = 0
+    var cost: float = 0.0
+    var durationMs: int = 0
+    var judgeModel: string = ""
+    var retries: int = 0
+
+    constructor(data: any) {
+        if (data != null) {
+            if (data.id != null) { this.id = string(data.id) }
+            if (data.input != null) { this.input = string(data.input) }
+            if (data.expected != null) { this.expected = string(data.expected) }
+            if (data.actual != null) { this.actual = string(data.actual) }
+            if (data.tags != null) { this.tags = _toStrings(data.tags) }
+            if (data.category != null) { this.category = string(data.category) }
+            if (data.score != null) { this.score = data.score }
+            if (data.passed != null) { this.passed = data.passed }
+            if (data.dimensions != null) { this.dimensions = _toAnyList(data.dimensions) }
+            if (data.reasoning != null) { this.reasoning = string(data.reasoning) }
+            if (data.issues != null) { this.issues = _toStrings(data.issues) }
+            if (data.tokens != null) { this.tokens = data.tokens }
+            if (data.cost != null) { this.cost = data.cost }
+            if (data.durationMs != null) { this.durationMs = data.durationMs }
+            if (data.judgeModel != null) { this.judgeModel = string(data.judgeModel) }
+            if (data.retries != null) { this.retries = data.retries }
+        }
+    }
+}
+
+// EvalBatch — summary of a completed batch
+export class EvalBatch {
+    var total: int
+    var passed: int
+    var failed: int
+    var passRate: float
+
+    constructor(total: int, passed: int, failed: int, passRate: float) {
+        this.total = total
+        this.passed = passed
+        this.failed = failed
+        this.passRate = passRate
+    }
+}
+
+// EvalError — wraps an error during evaluation
+export class EvalError {
+    var caseIndex: int
+    var message: string
+    var caseData: any
+
+    constructor(caseIndex: int, message: string, caseData: any) {
+        this.caseIndex = caseIndex
+        this.message = message
+        this.caseData = caseData
+    }
+}
+
+// ─── Dimension Config ───────────────────────────────────────────────────────
+
+export class DimensionConfig {
+    var name: string = ""
+    var weight: float = 1.0
+    var threshold: float = 0.7
+    var criteria: string = ""
+
+    constructor(data: any) {
+        if (data != null) {
+            if (data.name != null) { this.name = string(data.name) }
+            if (data.weight != null) { this.weight = data.weight }
+            if (data.threshold != null) { this.threshold = data.threshold }
+            if (data.criteria != null) { this.criteria = string(data.criteria) }
+        }
+    }
+}
+
+// ─── Few-Shot Example ───────────────────────────────────────────────────────
+
+export class FewShotExample {
+    var input: string = ""
+    var expected: string = ""
+    var actual: string = ""
+    var score: float = 0.0
+    var reasoning: string = ""
+
+    constructor(data: any) {
+        if (data != null) {
+            if (data.input != null) { this.input = string(data.input) }
+            if (data.expected != null) { this.expected = string(data.expected) }
+            if (data.actual != null) { this.actual = string(data.actual) }
+            if (data.score != null) { this.score = data.score }
+            if (data.reasoning != null) { this.reasoning = string(data.reasoning) }
+        }
+    }
+}
+
+// ─── Report Types ───────────────────────────────────────────────────────────
+
+// DimReport — aggregated scores for one dimension across all cases
+export class DimReport {
+    var name: string
+    var avgScore: float
+    var passRate: float
+    var threshold: float
+
+    constructor(name: string, avgScore: float, passRate: float, threshold: float) {
+        this.name = name
+        this.avgScore = avgScore
+        this.passRate = passRate
+        this.threshold = threshold
+    }
+}
+
+// PairwiseResult — result of comparing two outputs for one case
+export class PairwiseResult {
+    var input: string = ""
+    var winner: string = "tie"
+    var scoreA: float = 0.0
+    var scoreB: float = 0.0
+    var reasoning: string = ""
+
+    constructor(data: any) {
+        if (data != null) {
+            if (data.input != null) { this.input = string(data.input) }
+            if (data.winner != null) { this.winner = string(data.winner) }
+            if (data.scoreA != null) { this.scoreA = data.scoreA }
+            if (data.scoreB != null) { this.scoreB = data.scoreB }
+            if (data.reasoning != null) { this.reasoning = string(data.reasoning) }
+        }
+    }
+}

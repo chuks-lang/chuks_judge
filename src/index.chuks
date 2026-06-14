@@ -1,0 +1,822 @@
+// ┌─────────────────────────────────────────────────────────────────┐
+// │  chuks_judge — LLM Evaluation Engine for Chuks                  │
+// │                                                                 │
+// │  Parallel LLM-as-a-judge evaluation with multi-dimensional      │
+// │  scoring, A/B comparison, regression testing, and rich reports. │
+// │                                                                 │
+// │  Usage:                                                         │
+// │    import { judge } from "pkg/@chuks/judge"                     │
+// │    var evaluator = judge.create({                                │
+// │        model: "openai:gpt-4o",                                  │
+// │        criteria: "accuracy and helpfulness",                     │
+// │        threshold: 0.7                                           │
+// │    })                                                           │
+// │    var report = await evaluator.runAll(cases)                   │
+// │    report.print()                                               │
+// └─────────────────────────────────────────────────────────────────┘
+
+import { time } from "std/time"
+import { Channel } from "std/channel"
+import { os } from "std/os"
+import { EvalCase, EvalResult, DimScore, DimensionConfig, FewShotExample, PairwiseCase, PairwiseResult, ConversationTurn, ConversationCase, EvalBatch, EvalError } from "./types"
+import { EvalReport, RegressionReport, ComparisonReport } from "./report"
+
+// ─── Default Prompts ────────────────────────────────────────────────────────
+
+const DEFAULT_SYSTEM_PROMPT = "You are an expert LLM output evaluator. You assess AI-generated responses for quality, accuracy, and adherence to specified criteria. Be strict but fair. Always provide clear reasoning."
+
+const DEFAULT_RUBRIC = `Score the response on a scale from 0.0 to 1.0:
+- 1.0: Perfect — fully correct, complete, and well-formed
+- 0.8-0.9: Good — mostly correct with minor issues
+- 0.5-0.7: Partial — some correct elements but significant gaps
+- 0.2-0.4: Poor — mostly incorrect or incomplete
+- 0.0-0.1: Failed — completely wrong or irrelevant`
+
+const DEFAULT_JUDGE_TEMPLATE = `Evaluate the following AI response.
+
+**Input/Prompt:** {input}
+
+**Expected Response:** {expected}
+
+**Actual Response:** {actual}
+
+**Evaluation Criteria:** {criteria}
+
+**Scoring Rubric:**
+{rubric}
+
+{context}
+
+Respond with valid JSON:
+{
+  "score": <float 0.0-1.0>,
+  "passed": <bool>,
+  "reasoning": "<detailed explanation>",
+  "issues": ["<issue1>", "<issue2>"],
+}`
+
+const DIMENSION_TEMPLATE = `Evaluate the following AI response on the dimension: **{dimension}**
+
+**Criteria for this dimension:** {dimCriteria}
+
+**Input/Prompt:** {input}
+
+**Expected Response:** {expected}
+
+**Actual Response:** {actual}
+
+Score this dimension from 0.0 to 1.0. Respond with valid JSON:
+{
+  "score": <float 0.0-1.0>,
+  "passed": <bool>,
+  "reasoning": "<explanation for this dimension>",
+}`
+
+const PAIRWISE_TEMPLATE = `Compare these two AI responses and determine which is better.
+
+**Input/Prompt:** {input}
+
+**Response A:** {outputA}
+
+**Response B:** {outputB}
+
+**Evaluation Criteria:** {criteria}
+
+Respond with valid JSON:
+{
+  "winner": "<A, B, or tie>",
+  "scoreA": <float 0.0-1.0>,
+  "scoreB": <float 0.0-1.0>,
+  "reasoning": "<explanation>",
+}`
+
+// ─── Channel Message Types ────────────────────────────────────────────────────
+// Typed payloads carried over the work/result channels so the parallel workers
+// type-check cleanly under the AOT backend.
+
+dataType WorkItem {
+    index: int;
+    evalCase: any;
+}
+
+dataType PairWorkItem {
+    index: int;
+    pairCase: any;
+}
+
+// ─── Judge Factory ──────────────────────────────────────────────────────────
+
+class Judge {
+    // create builds an Evaluator from a config object.
+    //
+    // Config fields (all optional except as your use-case requires):
+    //   model:        "openai:gpt-4o" | "anthropic:..." | etc., OR a pre-built
+    //                 client object exposing `.structured(prompt, schema)`
+    //                 (used for testing / custom transports).
+    //   criteria:     string describing what to evaluate
+    //   rubric:       scoring rubric (default provided)
+    //   threshold:    float pass/fail cutoff (default 0.7)
+    //   scoreType:    "binary" | "numeric" (default "numeric")
+    //   workers:      int parallel workers (default os.cpus())
+    //   rateLimit:    int max requests/sec (default 0 = unlimited)
+    //   batchSize:    int cases per batch (default 10)
+    //   maxRetries:   int retries on failure (default 2)
+    //   dimensions:   []DimensionConfig for multi-dimensional scoring
+    //   fewShot:      []FewShotExample calibration examples
+    //   systemPrompt: custom system prompt
+    //   temperature:  float for judge model (default 0.0)
+    //   maxTokens:    int for judge response (default 1024)
+    //   callbacks:    { onResult, onBatch, onError, onComplete }
+    public create(config: any): Evaluator {
+        return new Evaluator(config)
+    }
+}
+
+// ─── Evaluator ──────────────────────────────────────────────────────────────
+
+export class Evaluator {
+    var _model: any
+    var _modelName: string = "openai:gpt-4o"
+    var _criteria: string = "accuracy and helpfulness"
+    var _rubric: string = DEFAULT_RUBRIC
+    var _threshold: float = 0.7
+    var _scoreType: string = "numeric"
+    var _workers: int = 1
+    var _rateLimit: int = 0
+    var _batchSize: int = 10
+    var _maxRetries: int = 2
+    var _dimensions: []any = []
+    var _fewShot: []any = []
+    var _systemPrompt: string = DEFAULT_SYSTEM_PROMPT
+    var _temperature: float = 0.0
+    var _maxTokens: int = 1024
+    var _callbacks: any
+
+    constructor(config: any) {
+        this._workers = os.cpus()
+        this._callbacks = {}
+
+        if (config != null) {
+            if (config.criteria != null) { this._criteria = string(config.criteria) }
+            if (config.rubric != null) { this._rubric = string(config.rubric) }
+            if (config.threshold != null) { this._threshold = config.threshold }
+            if (config.scoreType != null) { this._scoreType = string(config.scoreType) }
+            if (config.workers != null) { this._workers = config.workers }
+            if (config.rateLimit != null) { this._rateLimit = config.rateLimit }
+            if (config.batchSize != null) { this._batchSize = config.batchSize }
+            if (config.maxRetries != null) { this._maxRetries = config.maxRetries }
+            if (config.dimensions != null) { this._dimensions = _toAnyList(config.dimensions) }
+            if (config.fewShot != null) { this._fewShot = _toAnyList(config.fewShot) }
+            if (config.systemPrompt != null) { this._systemPrompt = string(config.systemPrompt) }
+            if (config.temperature != null) { this._temperature = config.temperature }
+            if (config.maxTokens != null) { this._maxTokens = config.maxTokens }
+            if (config.callbacks != null) { this._callbacks = config.callbacks }
+        }
+
+        // The judge model is supplied as a pre-built client object exposing an
+        // async `.structured(prompt, schema)` method — typically built with
+        // chuks_ai in the caller, e.g.:
+        //
+        //   import { ai } from "pkg/@chuks/ai"
+        //   var m = ai.openai("gpt-4o").system("...").temperature(0.0)
+        //   var ev = judge.create({ model: m, criteria: "accuracy" })
+        //
+        // The model is injected (not resolved here) deliberately: it keeps this
+        // package free of a hard import on the chuks_ai singleton, which lets
+        // the judge compile cleanly under the AOT backend, and it makes the
+        // evaluator trivially testable with an offline mock model.
+        //
+        // A "provider:model" string may be passed for `model`; it is recorded
+        // as the reported judge-model label, but a callable client must still
+        // be supplied via `model` for evaluation to run.
+        var modelField: any = null
+        if (config != null) { modelField = config.model }
+
+        if (modelField == null) {
+            this._modelName = "custom"
+            this._model = null
+        } else if (_isString(modelField)) {
+            this._modelName = string(modelField)
+            this._model = null
+        } else {
+            this._modelName = "custom"
+            this._model = modelField
+        }
+
+        // Allow an explicit model name label alongside an injected client.
+        if (config != null && config.modelName != null) {
+            this._modelName = string(config.modelName)
+        }
+
+        // A single sequential worker is fine; never spawn zero.
+        if (this._workers < 1) { this._workers = 1 }
+    }
+
+    // ── Single Case Evaluation ──────────────────────────────────
+
+    // evaluate runs the judge on a single EvalCase
+    async evaluate(evalCase: any): Task<EvalResult> {
+        var startMs: int = time.now()
+
+        // If dimensions are configured, evaluate each dimension separately
+        if (this._dimensions.length > 0) {
+            return await this._evaluateWithDimensions(evalCase, startMs)
+        }
+
+        var prompt: string = buildJudgePrompt(evalCase, this._criteria, this._rubric, this._fewShot)
+        return await this._callJudge(prompt, evalCase, startMs)
+    }
+
+    // ── Batch Evaluation ────────────────────────────────────────
+
+    // runAll evaluates all cases in parallel, returns an EvalReport
+    async runAll(cases: []any): Task<EvalReport> {
+        var startMs: int = time.now()
+        var total: int = cases.length
+
+        if (total == 0) {
+            var emptyReport: EvalReport = new EvalReport()
+            emptyReport.buildFromResults([], 0)
+            return emptyReport
+        }
+
+        var results: []any = []
+        var batches: []any = splitIntoBatches(cases, this._batchSize)
+        var resultCh: Channel<EvalResult> = new Channel<EvalResult>(total)
+        var batchIndex: int = 0
+
+        for (var bi: int = 0; bi < batches.length; bi = bi + 1) {
+            var batch: []any = batches[bi]
+            var workerCount: int = this._workers
+            if (workerCount > batch.length) { workerCount = batch.length }
+
+            var workCh: Channel<WorkItem> = new Channel<WorkItem>(batch.length)
+            for (var wi: int = 0; wi < batch.length; wi = wi + 1) {
+                var wItem: WorkItem = { index: batchIndex + wi, evalCase: batch[wi] }
+                workCh.send(wItem)
+            }
+            workCh.close()
+
+            for (var w: int = 0; w < workerCount; w = w + 1) {
+                spawn this._worker(workCh, resultCh)
+            }
+
+            if (this._rateLimit > 0 && bi < batches.length - 1) {
+                var delayMs: int = (1000 * batch.length) / this._rateLimit
+                time.sleep(delayMs)
+            }
+
+            batchIndex = batchIndex + batch.length
+
+            if (this._callbacks.onBatch != null) {
+                this._callbacks.onBatch({
+                    "batchNumber": bi + 1,
+                    "totalBatches": batches.length,
+                    "casesInBatch": batch.length,
+                })
+            }
+        }
+
+        for (var ri: int = 0; ri < total; ri = ri + 1) {
+            var res: EvalResult? = resultCh.receive()
+            if (res != null) { results.push(res) }
+        }
+
+        var durationMs: int = time.now() - startMs
+
+        var report: EvalReport = new EvalReport()
+        report.buildFromResults(results, durationMs)
+
+        if (this._dimensions.length > 0) {
+            report.dimensions = buildDimensionReport(results, this._dimensions)
+        }
+
+        if (this._callbacks.onComplete != null) {
+            this._callbacks.onComplete(report)
+        }
+
+        return report
+    }
+
+    // streamAll evaluates all cases and streams each result to a channel as it completes
+    async streamAll(cases: []any, outCh: Channel<EvalResult>): Task<EvalReport> {
+        var startMs: int = time.now()
+        var total: int = cases.length
+
+        if (total == 0) {
+            outCh.close()
+            var emptyReport: EvalReport = new EvalReport()
+            emptyReport.buildFromResults([], 0)
+            return emptyReport
+        }
+
+        var results: []any = []
+        var batches: []any = splitIntoBatches(cases, this._batchSize)
+        var resultCh: Channel<EvalResult> = new Channel<EvalResult>(total)
+        var batchIndex: int = 0
+
+        for (var bi: int = 0; bi < batches.length; bi = bi + 1) {
+            var batch: []any = batches[bi]
+            var workerCount: int = this._workers
+            if (workerCount > batch.length) { workerCount = batch.length }
+
+            var workCh: Channel<WorkItem> = new Channel<WorkItem>(batch.length)
+            for (var wi: int = 0; wi < batch.length; wi = wi + 1) {
+                var wItem: WorkItem = { index: batchIndex + wi, evalCase: batch[wi] }
+                workCh.send(wItem)
+            }
+            workCh.close()
+
+            for (var w: int = 0; w < workerCount; w = w + 1) {
+                spawn this._worker(workCh, resultCh)
+            }
+
+            for (var ri: int = 0; ri < batch.length; ri = ri + 1) {
+                var res: EvalResult? = resultCh.receive()
+                if (res != null) {
+                    results.push(res)
+                    outCh.send(res)
+                }
+            }
+
+            if (this._rateLimit > 0 && bi < batches.length - 1) {
+                var delayMs: int = (1000 * batch.length) / this._rateLimit
+                time.sleep(delayMs)
+            }
+
+            batchIndex = batchIndex + batch.length
+        }
+
+        outCh.close()
+
+        var durationMs: int = time.now() - startMs
+        var report: EvalReport = new EvalReport()
+        report.buildFromResults(results, durationMs)
+
+        if (this._dimensions.length > 0) {
+            report.dimensions = buildDimensionReport(results, this._dimensions)
+        }
+
+        return report
+    }
+
+    // ── Pairwise Comparison ─────────────────────────────────────
+
+    // compare runs A/B comparison on pairwise cases
+    async compare(cases: []any): Task<ComparisonReport> {
+        var total: int = cases.length
+        var pairResults: []any = []
+        var aWins: int = 0
+        var bWins: int = 0
+        var ties: int = 0
+        var sumA: float = 0.0
+        var sumB: float = 0.0
+
+        var report: ComparisonReport = new ComparisonReport()
+        if (total == 0) { return report }
+
+        var resultCh: Channel<PairwiseResult> = new Channel<PairwiseResult>(total)
+        var workCh: Channel<PairWorkItem> = new Channel<PairWorkItem>(total)
+
+        for (var i: int = 0; i < total; i = i + 1) {
+            var pItem: PairWorkItem = { index: i, pairCase: cases[i] }
+            workCh.send(pItem)
+        }
+        workCh.close()
+
+        var workerCount: int = this._workers
+        if (workerCount > total) { workerCount = total }
+
+        for (var w: int = 0; w < workerCount; w = w + 1) {
+            spawn this._pairwiseWorker(workCh, resultCh)
+        }
+
+        for (var ri: int = 0; ri < total; ri = ri + 1) {
+            var res: PairwiseResult? = resultCh.receive()
+            if (res != null) {
+                pairResults.push(res)
+                sumA = sumA + res.scoreA
+                sumB = sumB + res.scoreB
+                if (res.winner == "A") {
+                    aWins = aWins + 1
+                } else if (res.winner == "B") {
+                    bWins = bWins + 1
+                } else {
+                    ties = ties + 1
+                }
+            }
+        }
+
+        report.cases = pairResults
+        report.aWinRate = (float(aWins) / float(total)) * 100.0
+        report.bWinRate = (float(bWins) / float(total)) * 100.0
+        report.tieRate = (float(ties) / float(total)) * 100.0
+        report.avgScoreA = sumA / float(total)
+        report.avgScoreB = sumB / float(total)
+        report.improvement = report.avgScoreB - report.avgScoreA
+
+        if (aWins > bWins) {
+            report.winner = "A"
+        } else if (bWins > aWins) {
+            report.winner = "B"
+        } else {
+            report.winner = "tie"
+        }
+
+        return report
+    }
+
+    // ── Internal Workers ────────────────────────────────────────
+
+    // _worker processes eval cases from workCh and sends results to resultCh
+    async _worker(workCh: Channel<WorkItem>, resultCh: Channel<EvalResult>): Task<void> {
+        while (true) {
+            var item: WorkItem? = workCh.receive()
+            if (item == null) { break }
+            var result: EvalResult = await this.evaluate(item.evalCase)
+            resultCh.send(result)
+
+            if (this._callbacks.onResult != null) {
+                this._callbacks.onResult(result)
+            }
+        }
+        return
+    }
+
+    // _pairwiseWorker processes pairwise cases
+    async _pairwiseWorker(workCh: Channel<PairWorkItem>, resultCh: Channel<PairwiseResult>): Task<void> {
+        while (true) {
+            var item: PairWorkItem? = workCh.receive()
+            if (item == null) { break }
+            var pc: any = item.pairCase
+
+            var prompt: string = PAIRWISE_TEMPLATE
+            prompt = replaceAll(prompt, "{input}", string(pc.input))
+            prompt = replaceAll(prompt, "{outputA}", string(pc.outputA))
+            prompt = replaceAll(prompt, "{outputB}", string(pc.outputB))
+            prompt = replaceAll(prompt, "{criteria}", this._criteria)
+
+            // The judge response is genuinely dynamic JSON — read it off `any`.
+            var resp: any = await this._callModel(prompt, {
+                "winner": "string",
+                "scoreA": "float",
+                "scoreB": "float",
+                "reasoning": "string",
+            })
+
+            var winner: string = "tie"
+            var scoreA: float = 0.0
+            var scoreB: float = 0.0
+            var reasoning: string = "Judge failed to respond"
+            if (resp != null) {
+                if (resp.winner != null) { winner = string(resp.winner) }
+                if (resp.scoreA != null) { scoreA = resp.scoreA }
+                if (resp.scoreB != null) { scoreB = resp.scoreB }
+                if (resp.reasoning != null) { reasoning = string(resp.reasoning) }
+            }
+
+            var pr: PairwiseResult = new PairwiseResult({
+                "input": string(pc.input),
+                "winner": winner,
+                "scoreA": scoreA,
+                "scoreB": scoreB,
+                "reasoning": reasoning,
+            })
+            resultCh.send(pr)
+        }
+        return
+    }
+
+    // _callModel invokes the injected model's structured(prompt, schema). If no
+    // callable model was supplied (e.g. only a "provider:model" string), it
+    // returns null so callers fall through their normal null-response handling.
+    async _callModel(prompt: string, schema: any): Task<any> {
+        if (this._model == null) { return null }
+        return await this._model.structured(prompt, schema)
+    }
+
+    // _callJudge calls the LLM and parses the structured response with retries
+    async _callJudge(prompt: string, evalCase: any, startMs: int): Task<EvalResult> {
+        var retries: int = 0
+        var lastError: string = ""
+
+        while (retries <= this._maxRetries) {
+            // The judge response is genuinely dynamic JSON — read it off `any`.
+            var resp: any = await this._callModel(prompt, {
+                "score": "float",
+                "passed": "bool",
+                "reasoning": "string",
+                "issues": "[]string",
+            })
+
+            if (resp != null) {
+                var score: float = 0.0
+                if (resp.score != null) { score = resp.score }
+
+                if (this._scoreType == "binary") {
+                    score = score >= this._threshold ? 1.0 : 0.0
+                }
+
+                var passed: bool = score >= this._threshold
+                if (resp.passed != null) { passed = resp.passed }
+
+                var reasoning: string = ""
+                if (resp.reasoning != null) { reasoning = string(resp.reasoning) }
+
+                var issues: []any = []
+                if (resp.issues != null) { issues = _toAnyList(resp.issues) }
+
+                var durationMs: int = time.now() - startMs
+
+                return new EvalResult({
+                    "id": _caseStr(evalCase, "id"),
+                    "input": _caseStr(evalCase, "input"),
+                    "expected": _caseStr(evalCase, "expected"),
+                    "actual": _caseStr(evalCase, "actual"),
+                    "tags": _caseTags(evalCase),
+                    "category": _caseStr(evalCase, "category"),
+                    "score": score,
+                    "passed": passed,
+                    "dimensions": [],
+                    "reasoning": reasoning,
+                    "issues": issues,
+                    "tokens": 0,
+                    "cost": 0.0,
+                    "durationMs": durationMs,
+                    "judgeModel": this._modelName,
+                    "retries": retries,
+                })
+            }
+
+            retries = retries + 1
+            lastError = "Judge returned null response"
+
+            if (this._callbacks.onError != null) {
+                this._callbacks.onError({
+                    "message": lastError,
+                    "retry": retries,
+                    "caseId": _caseStr(evalCase, "id"),
+                })
+            }
+
+            time.sleep(500 * retries)
+        }
+
+        var failDuration: int = time.now() - startMs
+        return new EvalResult({
+            "id": _caseStr(evalCase, "id"),
+            "input": _caseStr(evalCase, "input"),
+            "expected": _caseStr(evalCase, "expected"),
+            "actual": _caseStr(evalCase, "actual"),
+            "tags": _caseTags(evalCase),
+            "category": _caseStr(evalCase, "category"),
+            "score": 0.0,
+            "passed": false,
+            "dimensions": [],
+            "reasoning": "Judge failed after " + string(this._maxRetries) + " retries: " + lastError,
+            "issues": ["judge_failure"],
+            "tokens": 0,
+            "cost": 0.0,
+            "durationMs": failDuration,
+            "judgeModel": this._modelName,
+            "retries": retries,
+        })
+    }
+
+    // _evaluateWithDimensions runs a separate judge call per dimension
+    async _evaluateWithDimensions(evalCase: any, startMs: int): Task<EvalResult> {
+        var dimScores: []any = []
+        var weightedSum: float = 0.0
+        var weightTotal: float = 0.0
+
+        for (var d: int = 0; d < this._dimensions.length; d = d + 1) {
+            var dim: any = this._dimensions[d]
+            var dimName: string = ""
+            if (dim.name != null) { dimName = string(dim.name) }
+            var dimCriteria: string = this._criteria
+            if (dim.criteria != null && string(dim.criteria) != "") { dimCriteria = string(dim.criteria) }
+            var dimThreshold: float = this._threshold
+            if (dim.threshold != null) { dimThreshold = dim.threshold }
+            var dimWeight: float = 1.0
+            if (dim.weight != null) { dimWeight = dim.weight }
+
+            var prompt: string = DIMENSION_TEMPLATE
+            prompt = replaceAll(prompt, "{dimension}", dimName)
+            prompt = replaceAll(prompt, "{dimCriteria}", dimCriteria)
+            prompt = replaceAll(prompt, "{input}", _caseStr(evalCase, "input"))
+            prompt = replaceAll(prompt, "{expected}", _caseStr(evalCase, "expected"))
+            prompt = replaceAll(prompt, "{actual}", _caseStr(evalCase, "actual"))
+
+            var resp: any = await this._callModel(prompt, {
+                "score": "float",
+                "passed": "bool",
+                "reasoning": "string",
+            })
+
+            var dimScore: float = 0.0
+            var dimReasoning: string = ""
+            if (resp != null) {
+                if (resp.score != null) { dimScore = resp.score }
+                if (resp.reasoning != null) { dimReasoning = string(resp.reasoning) }
+            }
+            var dimPassed: bool = dimScore >= dimThreshold
+
+            dimScores.push(new DimScore(dimName, dimScore, dimThreshold, dimPassed, dimReasoning))
+            weightedSum = weightedSum + (dimScore * dimWeight)
+            weightTotal = weightTotal + dimWeight
+        }
+
+        var finalScore: float = 0.0
+        if (weightTotal > 0.0) {
+            finalScore = weightedSum / weightTotal
+        }
+
+        var durationMs: int = time.now() - startMs
+
+        return new EvalResult({
+            "id": _caseStr(evalCase, "id"),
+            "input": _caseStr(evalCase, "input"),
+            "expected": _caseStr(evalCase, "expected"),
+            "actual": _caseStr(evalCase, "actual"),
+            "tags": _caseTags(evalCase),
+            "category": _caseStr(evalCase, "category"),
+            "score": finalScore,
+            "passed": finalScore >= this._threshold,
+            "dimensions": dimScores,
+            "reasoning": "Multi-dimensional evaluation across " + string(this._dimensions.length) + " dimensions",
+            "issues": [],
+            "tokens": 0,
+            "cost": 0.0,
+            "durationMs": durationMs,
+            "judgeModel": this._modelName,
+            "retries": 0,
+        })
+    }
+}
+
+// ─── Helper Functions ───────────────────────────────────────────────────────
+
+// _isString reports whether a dynamic value is a string.
+function _isString(v: any): bool {
+    return typeof(v) == "string"
+}
+
+// _toAnyList copies a dynamic array value into a typed []any.
+function _toAnyList(src: any): []any {
+    var out: []any = []
+    if (src == null) { return out }
+    var i: int = 0
+    while (i < src.length) {
+        out.push(src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// _caseStr reads a string field off a dynamic EvalCase (object or map).
+function _caseStr(evalCase: any, field: string): string {
+    if (evalCase == null) { return "" }
+    var v: any = null
+    if (field == "id") { v = evalCase.id }
+    else if (field == "input") { v = evalCase.input }
+    else if (field == "expected") { v = evalCase.expected }
+    else if (field == "actual") { v = evalCase.actual }
+    else if (field == "category") { v = evalCase.category }
+    if (v == null) { return "" }
+    return string(v)
+}
+
+// _caseTags reads the tags array off a dynamic EvalCase.
+function _caseTags(evalCase: any): []any {
+    if (evalCase == null) { return [] }
+    return _toAnyList(evalCase.tags)
+}
+
+// buildJudgePrompt constructs the evaluation prompt from template
+function buildJudgePrompt(evalCase: any, criteria: string, rubric: string, fewShot: []any): string {
+    var prompt: string = DEFAULT_JUDGE_TEMPLATE
+    prompt = replaceAll(prompt, "{input}", _caseStr(evalCase, "input"))
+    prompt = replaceAll(prompt, "{expected}", _caseStr(evalCase, "expected"))
+    prompt = replaceAll(prompt, "{actual}", _caseStr(evalCase, "actual"))
+    prompt = replaceAll(prompt, "{criteria}", criteria)
+    prompt = replaceAll(prompt, "{rubric}", rubric)
+
+    var contextStr: string = ""
+    if (evalCase != null && evalCase.context != null && string(evalCase.context) != "") {
+        contextStr = "**Additional Context:** " + string(evalCase.context)
+    }
+    prompt = replaceAll(prompt, "{context}", contextStr)
+
+    if (fewShot.length > 0) {
+        var examples: string = "Here are some calibration examples:\n\n"
+        for (var i: int = 0; i < fewShot.length; i = i + 1) {
+            var ex: any = fewShot[i]
+            examples = examples + "Example " + string(i + 1) + ":\n"
+            examples = examples + "  Input: " + _caseStr(ex, "input") + "\n"
+            examples = examples + "  Expected: " + _caseStr(ex, "expected") + "\n"
+            examples = examples + "  Actual: " + _caseStr(ex, "actual") + "\n"
+            var exScore: float = 0.0
+            if (ex != null && ex.score != null) { exScore = ex.score }
+            examples = examples + "  Score: " + string(exScore) + "\n"
+            var exReason: string = ""
+            if (ex != null && ex.reasoning != null) { exReason = string(ex.reasoning) }
+            examples = examples + "  Reasoning: " + exReason + "\n\n"
+        }
+        prompt = examples + "Now evaluate the following case:\n\n" + prompt
+    }
+
+    return prompt
+}
+
+// splitIntoBatches divides an array into chunks of batchSize
+function splitIntoBatches(items: []any, batchSize: int): []any {
+    var batches: []any = []
+    var size: int = batchSize
+    if (size < 1) { size = 1 }
+    var i: int = 0
+    while (i < items.length) {
+        var end: int = i + size
+        if (end > items.length) { end = items.length }
+        var batch: []any = []
+        for (var j: int = i; j < end; j = j + 1) {
+            batch.push(items[j])
+        }
+        batches.push(batch)
+        i = end
+    }
+    return batches
+}
+
+// buildDimensionReport aggregates dimension scores across all results
+function buildDimensionReport(results: []any, dimensions: []any): []any {
+    var dimReports: []any = []
+    for (var d: int = 0; d < dimensions.length; d = d + 1) {
+        var dim: any = dimensions[d]
+        var dimName: string = ""
+        if (dim.name != null) { dimName = string(dim.name) }
+        var dimThreshold: float = 0.7
+        if (dim.threshold != null) { dimThreshold = dim.threshold }
+
+        var totalScore: float = 0.0
+        var passCount: int = 0
+        var count: int = 0
+
+        for (var r: int = 0; r < results.length; r = r + 1) {
+            var result: any = results[r]
+            var dimScores: []any = result.dimensions
+            for (var ds: int = 0; ds < dimScores.length; ds = ds + 1) {
+                if (dimScores[ds].name == dimName) {
+                    totalScore = totalScore + dimScores[ds].score
+                    if (dimScores[ds].passed) {
+                        passCount = passCount + 1
+                    }
+                    count = count + 1
+                    break
+                }
+            }
+        }
+
+        if (count > 0) {
+            dimReports.push({
+                "name": dimName,
+                "avgScore": totalScore / float(count),
+                "passRate": (float(passCount) / float(count)) * 100.0,
+                "threshold": dimThreshold,
+            })
+        }
+    }
+    return dimReports
+}
+
+// replaceAll replaces all occurrences of needle in haystack with replacement
+function replaceAll(haystack: string, needle: string, replacement: string): string {
+    var result: string = haystack
+    while (result.contains(needle)) {
+        result = result.replace(needle, replacement)
+    }
+    return result
+}
+
+// ─── Singleton Export ───────────────────────────────────────────────────────
+
+const judge = new Judge()
+
+export {
+    judge,
+    Judge,
+    Evaluator,
+    EvalReport,
+    RegressionReport,
+    ComparisonReport,
+    EvalCase,
+    EvalResult,
+    DimScore,
+    DimensionConfig,
+    FewShotExample,
+    PairwiseCase,
+    PairwiseResult,
+    ConversationTurn,
+    ConversationCase,
+    EvalBatch,
+    EvalError
+}
