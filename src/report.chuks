@@ -236,7 +236,8 @@ export class EvalReport {
         var filtered: []any = []
         for (var i: int = 0; i < this.results.length; i = i + 1) {
             var r: any = this.results[i]
-            var tags: []any = r.tags
+            // (read as it is: a result's tags are a []string, which is not a []any)
+            var tags: any = r.tags
             for (var j: int = 0; j < tags.length; j = j + 1) {
                 if (tags[j] == tag) {
                     filtered.push(r)
